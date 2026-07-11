@@ -1,0 +1,681 @@
+--[[
+    Groq AI Chat Bot — client-side (executor)
+    - Répond directement dans le chat du jeu (plus de chatbox dans l'UI)
+    - Dropdown Target : "All" ou un joueur précis (refresh auto 10s)
+        -> cible = un joueur : répond UNIQUEMENT à SES messages
+    - Icône ↻ : reset la conversation
+    - Toggle ON/OFF (par défaut OFF) : active/désactive complètement le bot
+    - Toggle "Suivre la cible" (apparaît quand un joueur est ciblé)
+        -> mode "Stand" : flotte derrière la cible (BodyPosition/BodyGyro),
+           mouvement lissé, CanCollide off pour traverser au lieu de forcer
+    Warnings :
+    - HTTP côté client = besoin d'un executor (pas un LocalScript normal)
+    - clé Groq en clair dans le script -> clé jetable uniquement
+    - compatible ancien chat (DefaultChatSystemChatEvents) ET TextChatService
+]]
+
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+local GROQ_API_KEY = ""
+local GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+
+local AVAILABLE_MODELS = {
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
+    "groq/compound",
+}
+
+local PLAYER_LIST_REFRESH_SECONDS = 10
+local CHAT_COOLDOWN = 4          -- délai mini entre 2 réponses
+local MAX_REPLY_CHARS = 190      -- limite chat Roblox
+-- Mode "Stand" (flottement derrière la cible)
+local STAND_DISTANCE = 4         -- distance derrière la cible
+local STAND_SIDE = 2             -- décalage latéral (droite +)
+local STAND_HEIGHT = 2           -- hauteur de flottement
+local STAND_LERP = 0.35          -- vitesse de suivi (0.01 = lent, 1 = instant)
+local STAND_FLOAT_AMP = 0.5      -- amplitude du bobbing haut/bas
+local STAND_ANIMS = true         -- animations levitate/move (cosmétique)
+
+local selectedModel = AVAILABLE_MODELS[1]
+local selectedTarget = "All"
+local masterPrompt = [[You are ECHOES, a calm, witty and helpful AI companion in Roblox. 
+You are a JoJo Stand that floats behind the player.
+You observe the game and chat in real time and reply automatically.
+Personality:
+- Chill, slightly sarcastic and observant.
+- Helpful like Jarvis.
+- Light dry humor, never too dramatic.
+- You know you are floating behind the player.
+Rules:
+- Keep every reply under 190 characters.
+- Short and natural responses.
+- Plain text only, no markdown.
+- Adapt to the current game mood (chill, funny, serious...).
+- Stay in character as ECHOES at all times.
+- Never say you are a script or bot.
+Now respond naturally as ECHOES.]]
+local conversation = {}
+local chatDebounce = false
+local botEnabled = false -- << toggle principal, OFF par défaut
+local hasGreeted = false -- << message d'accueil envoyé une seule fois
+
+----------------------------------------------------------------
+-- SERVICES
+----------------------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Nom lisible du jeu (page Roblox) au lieu du nom interne, calculé une fois.
+local gameDisplayName = game.Name
+do
+    local ok, info = pcall(function()
+        return MarketplaceService:GetProductInfo(game.PlaceId)
+    end)
+    if ok and info and info.Name then
+        gameDisplayName = info.Name
+    end
+end
+
+-- forward declarations
+local dropdownList, targetDropdownList
+local followContainer, followToggle
+local startFollow, stopFollow, updateFollowButton
+local setStatus
+local followEnabled = false
+local standBP, standGyro, standConn
+local floatTime = 0
+local levitateTrack, moveTrack
+
+----------------------------------------------------------------
+-- HTTP WRAPPER
+----------------------------------------------------------------
+local function doHttpRequest(options)
+    local reqFn = (syn and syn.request)
+        or (http and http.request)
+        or (fluxus and fluxus.request)
+        or http_request
+        or request
+    if reqFn then
+        local ok, result = pcall(reqFn, options)
+        if ok then return result end
+        error("HTTP request failed: " .. tostring(result))
+    end
+    local ok, result = pcall(function() return HttpService:RequestAsync(options) end)
+    if ok then return result end
+    error("No working HTTP function found. Needs an executor with client-side HTTP.")
+end
+
+local function callGroq(userMessage)
+    table.insert(conversation, { role = "user", content = userMessage })
+    -- trim l'historique pour pas exploser les tokens
+    while #conversation > 20 do table.remove(conversation, 1) end
+
+    local gameContext = "Current game: " .. gameDisplayName .. ". The player is playing casually."
+
+    local messages = {
+        { role = "system", content = masterPrompt },
+        { role = "system", content = gameContext },
+    }
+    for _, m in ipairs(conversation) do table.insert(messages, m) end
+
+    local body = HttpService:JSONEncode({
+        model = selectedModel,
+        messages = messages,
+        temperature = 0.9,
+        max_tokens = 120,
+    })
+
+    local ok, response = pcall(doHttpRequest, {
+        Url = GROQ_ENDPOINT,
+        Method = "POST",
+        Headers = {
+            ["Authorization"] = "Bearer " .. GROQ_API_KEY,
+            ["Content-Type"] = "application/json",
+        },
+        Body = body,
+    })
+    if not ok then return false, "Request error: " .. tostring(response) end
+    if response.StatusCode and response.StatusCode ~= 200 then
+        return false, "API error (" .. tostring(response.StatusCode) .. ")"
+    end
+
+    local decodedOk, decoded = pcall(function() return HttpService:JSONDecode(response.Body) end)
+    if not decodedOk then return false, "Decode failed" end
+    if decoded.error then return false, "Groq: " .. tostring(decoded.error.message) end
+
+    local choice = decoded.choices and decoded.choices[1]
+    local reply = choice and choice.message and choice.message.content
+    if not reply then return false, "Bad format" end
+
+    table.insert(conversation, { role = "assistant", content = reply })
+    return true, reply
+end
+
+----------------------------------------------------------------
+-- CHAT (listen + send) — legacy + TextChatService
+----------------------------------------------------------------
+local function sendChatMessage(text)
+    text = tostring(text):gsub("[\r\n]+", " ")
+    if #text > MAX_REPLY_CHARS then text = text:sub(1, MAX_REPLY_CHARS) end
+
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        local channels = TextChatService:FindFirstChild("TextChannels")
+        if channels then
+            local general = channels:FindFirstChild("RBXGeneral")
+            if general then general:SendAsync(text) return end
+            for _, ch in ipairs(channels:GetChildren()) do
+                if ch:IsA("TextChannel") then ch:SendAsync(text) return end
+            end
+        end
+    else
+        local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+        local say = events and events:FindFirstChild("SayMessageRequest")
+        if say then say:FireServer(text, "All") end
+    end
+end
+
+-- Message d'accueil : ECHOES se présente comme l'assistant du joueur (1 seule fois)
+local function sendGreeting()
+    if hasGreeted then return end
+    hasGreeted = true
+    task.spawn(function()
+        local ok, reply = callGroq("Greet the player for the first time. Introduce yourself as their personal AI assistant floating behind them. Keep it one short line, under 190 characters.")
+        if ok and reply then
+            sendChatMessage(reply)
+            if setStatus then setStatus("Accueil envoyé") end
+        else
+            hasGreeted = false -- échec -> on pourra réessayer
+        end
+    end)
+end
+
+local function onPlayerMessage(fromPlayer, message)
+    if not botEnabled then return end -- << bot désactivé, on ignore tout
+    if not fromPlayer or fromPlayer == player then return end
+    if selectedTarget ~= "All" and fromPlayer.Name ~= selectedTarget then return end
+    if chatDebounce or not message or #message < 1 then return end
+    chatDebounce = true
+    if setStatus then setStatus("Réponse à " .. fromPlayer.Name .. "...") end
+    task.spawn(function()
+        local ok, reply = callGroq(message)
+        if ok and reply then
+            sendChatMessage(reply)
+            if setStatus then setStatus("Envoyé") end
+        else
+            if setStatus then setStatus("Err: " .. tostring(reply)) end
+        end
+        task.wait(CHAT_COOLDOWN)
+        chatDebounce = false
+    end)
+end
+
+-- listener legacy
+do
+    local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    if events then
+        local onFiltered = events:FindFirstChild("OnMessageDoneFiltering")
+        if onFiltered then
+            onFiltered.OnClientEvent:Connect(function(tbl)
+                onPlayerMessage(Players:FindFirstChild(tbl.FromSpeaker), tbl.Message)
+            end)
+        end
+    end
+end
+-- listener TextChatService
+if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+    TextChatService.MessageReceived:Connect(function(msg)
+        local src = msg.TextSource
+        if src then
+            onPlayerMessage(Players:GetPlayerByUserId(src.UserId), msg.Text)
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- FOLLOW — mode "Stand" (flottement lissé derrière la cible)
+----------------------------------------------------------------
+local function getTargetPlayer()
+    if selectedTarget == "All" then return nil end
+    return Players:FindFirstChild(selectedTarget)
+end
+
+local function setCharCollide(char, canCollide)
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = canCollide
+        end
+    end
+end
+
+-- Animations levitate / move (cosmétique, IDs repris du script stand)
+local levitateIdle = Instance.new("Animation")
+levitateIdle.AnimationId = "rbxassetid://122746752555782"
+local moveAnim = Instance.new("Animation")
+moveAnim.AnimationId = "rbxassetid://10921135644"
+
+local function getHumanoid()
+    local char = player.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function playLevitate()
+    local hum = getHumanoid()
+    if STAND_ANIMS and hum and not levitateTrack then
+        levitateTrack = hum:LoadAnimation(levitateIdle)
+        levitateTrack.Priority = Enum.AnimationPriority.Idle
+        levitateTrack.Looped = true
+        levitateTrack:Play()
+    end
+end
+local function stopLevitate()
+    if levitateTrack then levitateTrack:Stop(); levitateTrack:Destroy(); levitateTrack = nil end
+end
+local function playMove()
+    local hum = getHumanoid()
+    if STAND_ANIMS and hum and not moveTrack then
+        moveTrack = hum:LoadAnimation(moveAnim)
+        moveTrack.Priority = Enum.AnimationPriority.Movement
+        moveTrack.Looped = true
+        moveTrack:Play()
+    end
+end
+local function stopMove()
+    if moveTrack then moveTrack:Stop(); moveTrack:Destroy(); moveTrack = nil end
+end
+
+local function buildStandForces(hrp)
+    standBP = Instance.new("BodyPosition")
+    standBP.MaxForce = Vector3.new(4e5, 4e5, 4e5)
+    standBP.P = 2000
+    standBP.D = 50
+    standBP.Position = hrp.Position
+    standBP.Parent = hrp
+
+    standGyro = Instance.new("BodyGyro")
+    standGyro.P = 2000
+    standGyro.D = 50
+    standGyro.MaxTorque = Vector3.new(4e5, 4e5, 4e5)
+    standGyro.CFrame = hrp.CFrame
+    standGyro.Parent = hrp
+end
+
+local function clearStandForces()
+    if standBP then standBP:Destroy(); standBP = nil end
+    if standGyro then standGyro:Destroy(); standGyro = nil end
+end
+
+startFollow = function()
+    if followEnabled then return end
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    followEnabled = true
+    updateFollowButton()
+
+    setCharCollide(char, false)
+    buildStandForces(hrp)
+
+    standConn = RunService.RenderStepped:Connect(function(dt)
+        if not followEnabled then return end
+
+        local myChar = player.Character
+        local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        if not myHrp then return end
+
+        -- respawn : les forces sont sur l'ancien HRP -> on rebâtit
+        if not standBP or standBP.Parent ~= myHrp then
+            clearStandForces()
+            setCharCollide(myChar, false)
+            buildStandForces(myHrp)
+        end
+
+        local targetPlr = getTargetPlayer()
+        local tChar = targetPlr and targetPlr.Character
+        local tHrp = tChar and tChar:FindFirstChild("HumanoidRootPart")
+        if not tHrp then
+            stopMove(); playLevitate()
+            return
+        end
+
+        floatTime += dt * 2
+        local floatOffset = math.sin(floatTime) * STAND_FLOAT_AMP
+
+        local tcf = tHrp.CFrame
+        local desired = tcf.Position
+            - tcf.LookVector * STAND_DISTANCE
+            + tcf.RightVector * STAND_SIDE
+            + Vector3.new(0, STAND_HEIGHT + floatOffset, 0)
+
+        standBP.Position = standBP.Position:Lerp(desired, math.clamp(STAND_LERP, 0.01, 1))
+        standGyro.CFrame = CFrame.new(myHrp.Position, myHrp.Position + tcf.LookVector)
+
+        -- anim selon que la cible bouge ou non
+        local tHum = tChar:FindFirstChildOfClass("Humanoid")
+        if tHum and tHum.MoveDirection.Magnitude > 0 then
+            stopLevitate(); playMove()
+        else
+            stopMove(); playLevitate()
+        end
+    end)
+end
+
+stopFollow = function()
+    followEnabled = false
+    if standConn then standConn:Disconnect(); standConn = nil end
+    clearStandForces()
+    stopLevitate(); stopMove()
+    setCharCollide(player.Character, true)
+    updateFollowButton()
+end
+
+-- respawn : on coupe le follow proprement (re-toggle pour relancer)
+player.CharacterAdded:Connect(function()
+    if followEnabled then stopFollow() end
+end)
+
+----------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------
+local function create(class, props)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    return inst
+end
+
+local screenGui = create("ScreenGui", {
+    Name = "GroqChatGUI",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    Parent = playerGui,
+})
+
+local mainFrame = create("Frame", {
+    Name = "MainFrame",
+    Size = UDim2.new(0, 420, 0, 322),
+    Position = UDim2.new(0.5, -210, 0.5, -161),
+    BackgroundColor3 = Color3.fromRGB(30, 30, 34),
+    BorderSizePixel = 0,
+    Parent = screenGui,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 10), Parent = mainFrame })
+
+-- Title bar
+local titleBar = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 36),
+    BackgroundColor3 = Color3.fromRGB(20, 20, 24),
+    BorderSizePixel = 0, Parent = mainFrame,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 10), Parent = titleBar })
+create("TextLabel", {
+    Size = UDim2.new(1, -140, 1, 0), Position = UDim2.new(0, 12, 0, 0),
+    BackgroundTransparency = 1, Text = "Groq AI Chat",
+    TextColor3 = Color3.fromRGB(240, 240, 240), Font = Enum.Font.GothamBold,
+    TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left, Parent = titleBar,
+})
+
+-- Toggle ON/OFF principal (par défaut OFF)
+local botToggleButton = create("TextButton", {
+    Size = UDim2.new(0, 46, 0, 28), Position = UDim2.new(1, -120, 0, 4),
+    BackgroundColor3 = Color3.fromRGB(70, 70, 78), Text = "OFF",
+    TextColor3 = Color3.fromRGB(255, 255, 255), Font = Enum.Font.GothamBold,
+    TextSize = 13, Parent = titleBar,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = botToggleButton })
+
+local function updateBotToggleButton()
+    if botEnabled then
+        botToggleButton.Text = "ON"
+        botToggleButton.BackgroundColor3 = Color3.fromRGB(60, 180, 90)
+    else
+        botToggleButton.Text = "OFF"
+        botToggleButton.BackgroundColor3 = Color3.fromRGB(70, 70, 78)
+    end
+end
+botToggleButton.MouseButton1Click:Connect(function()
+    botEnabled = not botEnabled
+    updateBotToggleButton()
+    if setStatus then
+        setStatus(botEnabled and "Bot activé" or "Bot désactivé")
+    end
+    if botEnabled then
+        sendGreeting() -- se présente au premier lancement
+    end
+end)
+
+local clearButton = create("TextButton", {
+    Size = UDim2.new(0, 28, 0, 28), Position = UDim2.new(1, -68, 0, 4),
+    BackgroundColor3 = Color3.fromRGB(60, 60, 68), Text = "↻",
+    TextColor3 = Color3.fromRGB(255, 255, 255), Font = Enum.Font.GothamBold,
+    TextSize = 16, Parent = titleBar,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = clearButton })
+clearButton.MouseButton1Click:Connect(function()
+    conversation = {}
+    hasGreeted = false -- reset complet -> se re-présentera au prochain ON
+    if setStatus then setStatus("Conversation reset") end
+end)
+
+local closeButton = create("TextButton", {
+    Size = UDim2.new(0, 28, 0, 28), Position = UDim2.new(1, -34, 0, 4),
+    BackgroundColor3 = Color3.fromRGB(200, 60, 60), Text = "X",
+    TextColor3 = Color3.fromRGB(255, 255, 255), Font = Enum.Font.GothamBold,
+    TextSize = 14, Parent = titleBar,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = closeButton })
+closeButton.MouseButton1Click:Connect(function() screenGui.Enabled = false end)
+
+-- Drag
+do
+    local dragging, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, mainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    titleBar.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+-- Master prompt
+create("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18), Position = UDim2.new(0, 10, 0, 44),
+    BackgroundTransparency = 1, Text = "Master Prompt (System Instructions)",
+    TextColor3 = Color3.fromRGB(180, 180, 190), Font = Enum.Font.Gotham,
+    TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, Parent = mainFrame,
+})
+local promptBox = create("TextBox", {
+    Size = UDim2.new(1, -20, 0, 50), Position = UDim2.new(0, 10, 0, 62),
+    BackgroundColor3 = Color3.fromRGB(45, 45, 50), TextColor3 = Color3.fromRGB(230, 230, 230),
+    PlaceholderText = "e.g. You are a snarky pirate...", PlaceholderColor3 = Color3.fromRGB(120, 120, 130),
+    Text = masterPrompt, Font = Enum.Font.Gotham, TextSize = 13, ClearTextOnFocus = false,
+    MultiLine = true, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Parent = mainFrame,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = promptBox })
+create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingTop = UDim.new(0, 6), PaddingRight = UDim.new(0, 8), Parent = promptBox })
+promptBox:GetPropertyChangedSignal("Text"):Connect(function() masterPrompt = promptBox.Text end)
+
+-- Model dropdown
+create("TextLabel", {
+    Size = UDim2.new(0.5, -15, 0, 18), Position = UDim2.new(0, 10, 0, 120),
+    BackgroundTransparency = 1, Text = "Model", TextColor3 = Color3.fromRGB(180, 180, 190),
+    Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, Parent = mainFrame,
+})
+local dropdownButton = create("TextButton", {
+    Size = UDim2.new(1, -20, 0, 32), Position = UDim2.new(0, 10, 0, 138),
+    BackgroundColor3 = Color3.fromRGB(45, 45, 50), Text = "  " .. selectedModel .. "  ▾",
+    TextColor3 = Color3.fromRGB(230, 230, 230), Font = Enum.Font.Gotham, TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false, ZIndex = 4, Parent = mainFrame,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = dropdownButton })
+
+dropdownList = create("Frame", {
+    Size = UDim2.new(1, -20, 0, #AVAILABLE_MODELS * 28), Position = UDim2.new(0, 10, 0, 172),
+    BackgroundColor3 = Color3.fromRGB(45, 45, 50), Visible = false, ZIndex = 5, Parent = mainFrame,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = dropdownList })
+create("UIListLayout", { Parent = dropdownList, SortOrder = Enum.SortOrder.LayoutOrder })
+
+for _, modelName in ipairs(AVAILABLE_MODELS) do
+    local optionButton = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Color3.fromRGB(60, 60, 68),
+        BackgroundTransparency = 1, Text = "  " .. modelName, TextColor3 = Color3.fromRGB(220, 220, 225),
+        Font = Enum.Font.Gotham, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 6, Parent = dropdownList,
+    })
+    optionButton.MouseButton1Click:Connect(function()
+        selectedModel = modelName
+        dropdownButton.Text = "  " .. selectedModel .. "  ▾"
+        dropdownList.Visible = false
+    end)
+    optionButton.MouseEnter:Connect(function() optionButton.BackgroundTransparency = 0 end)
+    optionButton.MouseLeave:Connect(function() optionButton.BackgroundTransparency = 1 end)
+end
+dropdownButton.MouseButton1Click:Connect(function()
+    dropdownList.Visible = not dropdownList.Visible
+    if targetDropdownList then targetDropdownList.Visible = false end
+end)
+
+-- Target dropdown
+create("TextLabel", {
+    Size = UDim2.new(0.7, -15, 0, 18), Position = UDim2.new(0, 10, 0, 178),
+    BackgroundTransparency = 1, Text = "Target (qui déclenche une réponse)",
+    TextColor3 = Color3.fromRGB(180, 180, 190), Font = Enum.Font.Gotham, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = mainFrame,
+})
+local targetDropdownButton = create("TextButton", {
+    Size = UDim2.new(1, -20, 0, 32), Position = UDim2.new(0, 10, 0, 196),
+    BackgroundColor3 = Color3.fromRGB(45, 45, 50), Text = "  Target: All  ▾",
+    TextColor3 = Color3.fromRGB(230, 230, 230), Font = Enum.Font.Gotham, TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false, ZIndex = 4, Parent = mainFrame,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = targetDropdownButton })
+
+targetDropdownList = create("ScrollingFrame", {
+    Size = UDim2.new(1, -20, 0, 140), Position = UDim2.new(0, 10, 0, 230),
+    BackgroundColor3 = Color3.fromRGB(45, 45, 50), Visible = false, ZIndex = 5,
+    ScrollBarThickness = 4, CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = mainFrame,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 6), Parent = targetDropdownList })
+create("UIListLayout", { Parent = targetDropdownList, SortOrder = Enum.SortOrder.LayoutOrder })
+targetDropdownButton.MouseButton1Click:Connect(function()
+    targetDropdownList.Visible = not targetDropdownList.Visible
+    dropdownList.Visible = false
+end)
+
+-- Follow toggle (visible seulement si cible != All)
+followContainer = create("Frame", {
+    Size = UDim2.new(1, -20, 0, 30), Position = UDim2.new(0, 10, 0, 236),
+    BackgroundTransparency = 1, Visible = false, Parent = mainFrame,
+})
+create("TextLabel", {
+    Size = UDim2.new(1, -70, 1, 0), BackgroundTransparency = 1, Text = "Suivre la cible",
+    TextColor3 = Color3.fromRGB(210, 210, 220), Font = Enum.Font.Gotham, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = followContainer,
+})
+followToggle = create("TextButton", {
+    Size = UDim2.new(0, 56, 0, 26), Position = UDim2.new(1, -56, 0, 2),
+    BackgroundColor3 = Color3.fromRGB(70, 70, 78), Text = "OFF",
+    TextColor3 = Color3.fromRGB(255, 255, 255), Font = Enum.Font.GothamBold, TextSize = 13, Parent = followContainer,
+})
+create("UICorner", { CornerRadius = UDim.new(0, 13), Parent = followToggle })
+
+updateFollowButton = function()
+    if not followToggle then return end
+    if followEnabled then
+        followToggle.Text = "ON"
+        followToggle.BackgroundColor3 = Color3.fromRGB(60, 180, 90)
+    else
+        followToggle.Text = "OFF"
+        followToggle.BackgroundColor3 = Color3.fromRGB(70, 70, 78)
+    end
+end
+followToggle.MouseButton1Click:Connect(function()
+    if followEnabled then stopFollow() else startFollow() end
+end)
+
+-- Status
+local statusLabel = create("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 20), Position = UDim2.new(0, 10, 0, 296),
+    BackgroundTransparency = 1, Text = "En attente...", TextColor3 = Color3.fromRGB(150, 150, 160),
+    Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, Parent = mainFrame,
+})
+setStatus = function(txt) statusLabel.Text = txt end
+
+----------------------------------------------------------------
+-- TARGET SELECT + REFRESH
+----------------------------------------------------------------
+local function selectTarget(value, label)
+    label = label or value
+    selectedTarget = value
+    targetDropdownButton.Text = "  Target: " .. label .. "  ▾"
+    targetDropdownList.Visible = false
+    followContainer.Visible = (value ~= "All")
+    if value == "All" then stopFollow() end
+end
+
+local function rebuildTargetList()
+    for _, child in ipairs(targetDropdownList:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    -- entries : value = vrai username (pour le matching), label = affichage
+    local entries = { { value = "All", label = "All" } }
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player then
+            local label = plr.Name
+            if plr.DisplayName and plr.DisplayName ~= "" and plr.DisplayName ~= plr.Name then
+                label = plr.DisplayName .. " (@" .. plr.Name .. ")"
+            end
+            table.insert(entries, { value = plr.Name, label = label })
+        end
+    end
+
+    local stillPresent = false
+    for _, e in ipairs(entries) do if e.value == selectedTarget then stillPresent = true break end end
+    if not stillPresent then selectTarget("All") end
+
+    for i, e in ipairs(entries) do
+        local optionButton = create("TextButton", {
+            Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Color3.fromRGB(60, 60, 68),
+            BackgroundTransparency = 1, Text = "  " .. e.label, TextColor3 = Color3.fromRGB(220, 220, 225),
+            Font = Enum.Font.Gotham, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = 6, LayoutOrder = i, Parent = targetDropdownList,
+        })
+        optionButton.MouseButton1Click:Connect(function() selectTarget(e.value, e.label) end)
+        optionButton.MouseEnter:Connect(function() optionButton.BackgroundTransparency = 0 end)
+        optionButton.MouseLeave:Connect(function() optionButton.BackgroundTransparency = 1 end)
+    end
+end
+
+task.spawn(function()
+    while screenGui.Parent do
+        rebuildTargetList()
+        task.wait(PLAYER_LIST_REFRESH_SECONDS)
+    end
+end)
+
+updateFollowButton()
+updateBotToggleButton()
+setStatus("Prêt (Bot désactivé)")
